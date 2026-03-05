@@ -1,0 +1,172 @@
+exel_baugruppe
+import pandas as pd
+
+def get_excel_tasks(file_path):
+    """Liest die Excel und gibt eine Liste mit Filter-Keywords und Metadaten zurück."""
+    try:
+        df = pd.read_excel(file_path)
+        # Normalisiere Spaltennamen (Kleinschreibung, keine Leerzeichen)
+        df.columns = [c.strip() for c in df.columns]
+    except Exception as e:
+        print(f"Fehler beim Lesen der Excel: {e}")
+        return []
+
+    tasks = []
+    for _, row in df.iterrows():
+        # Check: Indiz Software vorhanden
+        if str(row.get("Hat Software", "")).lower() == "ja":
+            # Extrahiere wichtige Infos für die API-Anfrage
+            keywords = [
+                str(row.get("Schnittstelle", "")), 
+                str(row.get("Software-Typ", ""))
+            ]
+            # Bereinige Liste von leeren Einträgen
+            keywords = [k for k in keywords if k and str(k).lower() != "nan"]
+            
+            tasks.append({
+                "materialnummer": str(row.get("Materialnummer", "000000")).strip(),
+                "bezeichnung": str(row.get("Bezeichnung", "")).strip(),
+                "keywords": keywords
+            })
+    return tasks
+
+
+mitre_api
+import requests
+
+SOURCES = {
+    "ics": "https://raw.githubusercontent.com/mitre/cti/master/ics-attack/ics-attack.json",
+    "enterprise": "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
+}
+
+def fetch_mitre_data():
+    """Holt die aktuellen Rohdaten von der MITRE Website."""
+    all_objects = []
+    for domain, url in SOURCES.items():
+        print(f"Lade {domain} Daten von MITRE...")
+        try:
+            res = requests.get(url, timeout=20)
+            if res.status_code == 200:
+                all_objects.extend(res.json().get("objects", []))
+        except Exception as e:
+            print(f"Netzwerkfehler bei {domain}: {e}")
+    return all_objects
+
+
+
+mitre_pipeline
+import json
+import os
+from datetime import datetime
+from exel_baugruppe import get_excel_tasks
+from mitre_api import fetch_mitre_data
+
+SUBREPO_PATH = "subrepo/groups"
+
+def run_pipeline():
+    # 1. Vorbereitung
+    os.makedirs(SUBREPO_PATH, exist_ok=True)
+    
+    # 2. Daten sammeln
+    raw_data = fetch_mitre_data()
+    tasks = get_excel_tasks("Produktliste_Luetze.xlsx")
+    
+    if not raw_data or not tasks:
+        print("Pipeline abgebrochen: Datenquellen unvollständig.")
+        return
+
+    # 3. Verarbeiten und Filtern
+    for task in tasks:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        clean_name = "".join(e for e in task['bezeichnung'] if e.isalnum() or e == " ").replace(" ", "-")
+        
+        # Korrekte Namensgebung nach Wunsch
+        filename = f"{timestamp}_{task['materialnummer']}_{clean_name}.json"
+        filepath = os.path.join(SUBREPO_PATH, filename)
+        
+        filtered_threats = []
+        for obj in raw_data:
+            if obj.get("type") == "attack-pattern":
+                name = obj.get("name", "").lower()
+                desc = obj.get("description", "").lower()
+                
+                # Suche Keywords in Name ODER Beschreibung
+                if any(k.lower() in name or k.lower() in desc for k in task['keywords']):
+                    filtered_threats.append({
+                        "id": obj.get("external_references", [{}])[0].get("external_id"),
+                        "name": obj.get("name"),
+                        "description": obj.get("description")
+                    })
+        
+        # 4. Speichern im Subrepo
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(filtered_threats, f, indent=4, ensure_ascii=False)
+        print(f"Gefiltert: {filename} ({len(filtered_threats)} Bedrohungen)")
+
+if __name__ == "__main__":
+    run_pipeline()
+
+
+
+update_v1
+import os
+import json
+import shutil
+
+def get_mat_from_filename(fname):
+    parts = fname.split("_")
+    return parts[2] if len(parts) > 2 else None
+
+def run_update_management():
+    sub_dir = "subrepo/groups"
+    v1_dir = "projects/v1_0"
+    
+    # 1. Initial-Check: Falls Ordner leer oder nicht existiert
+    if not os.path.exists(v1_dir) or not os.listdir(v1_dir):
+        print("v1_0 ist leer oder existiert nicht. Starte initiales Kopieren...")
+        os.makedirs(v1_dir, exist_ok=True)
+        for f in os.listdir(sub_dir):
+            if f.endswith(".json"):
+                shutil.copy2(os.path.join(sub_dir, f), os.path.join(v1_dir, f))
+                print(f"Initial kopiert: {f}")
+        return
+
+    # 2. Update-Logik: Bestehende v1_0 prüfen
+    sub_files = [f for f in os.listdir(sub_dir) if f.endswith(".json")]
+    v1_files = [f for f in os.listdir(v1_dir) if f.endswith(".json")]
+    v1_mat_map = {get_mat_from_filename(f): f for f in v1_files if get_mat_from_filename(f)}
+
+    for s_file in sub_files:
+        s_mat = get_mat_from_filename(s_file)
+        if not s_mat: continue
+        s_path = os.path.join(sub_dir, s_file)
+        
+        # NEUES BAUTEIL (in v1_0 noch nicht vorhanden)
+        if s_mat not in v1_mat_map:
+            if input(f"\nNEUE DATEI im Subrepo: {s_file}. Zu v1.0 hinzufügen? (y/n): ").lower() == 'y':
+                shutil.copy2(s_path, os.path.join(v1_dir, s_file))
+                print("Hinzugefügt.")
+        
+        # BESTEHENDES BAUTEIL (Prüfe auf neue Gefahren / Append-Logik)
+        else:
+            v1_path = os.path.join(v1_dir, v1_mat_map[s_mat])
+            with open(s_path, "r", encoding="utf-8") as f: s_data = json.load(f)
+            with open(v1_path, "r", encoding="utf-8") as f: v1_data = json.load(f)
+            
+            v1_ids = {item["id"] for item in v1_data}
+            new_threats = [item for item in s_data if item["id"] not in v1_ids]
+            
+            if new_threats:
+                print(f"\nÄNDERUNG für MatNr {s_mat}: {len(new_threats)} neue Gefahren im Subrepo.")
+                for t in new_threats:
+                    print(f"  -> [{t['id']}] {t['name']}")
+                
+                if input(f"Diese {len(new_threats)} Gefahren an v1.0 ANHÄNGEN? (Expertenwissen bleibt erhalten) (y/n): ").lower() == 'y':
+                    # Wichtig: Wir hängen nur an (append), wir überschreiben nicht!
+                    v1_data.extend(new_threats)
+                    with open(v1_path, "w", encoding="utf-8") as f:
+                        json.dump(v1_data, f, indent=4, ensure_ascii=False)
+                    print("Gefahren erfolgreich hinzugefügt.")
+
+if __name__ == "__main__":
+    run_update_management()
