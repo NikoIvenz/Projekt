@@ -1,75 +1,91 @@
 import json
 import os
 from datetime import datetime
-from exel_baugruppe import get_excel_tasks
-from mitre_api import fetch_mitre_data
+# from exel_baugruppe import get_excel_tasks
+# from mitre_api import fetch_mitre_data
 
 # --- KONFIGURATION ---
 SUBREPO_PATH = "subrepo/groups"
+
 # Nur diese Plattformen sind für Lütze Hardware relevant:
-VALID_PLATFORMS = ["field controller/rtu/plc/ied", "input/output server", "control server", "none"]
-BLACKLIST = ["cloud", "azure", "office 365", "macos", "ios", "active directory"]
+TEST = [
+    {'materialnummer': '123', 'bezeichnung': 'CAN Bus', 'keywords': 'Can Bus'},
+    {'materialnummer': '13',  'bezeichnung': 'Serial', 'keywords': 'Serial'},
+    {'materialnummer': '33',  'bezeichnung': 'Ethernet','keywords': 'Ethernet'}
+]
+
+def filter_mitre_for_hardware(raw_mitre_data, hardware_list):
+    """
+    Filtert die MITRE-Daten basierend auf den Keywords der Hardware-Komponenten.
+    Gibt eine strukturierte Liste zurück, die optimal für eine Threat Analyse ist.
+    """
+    analyzed_hardware = []
+
+    for hw in hardware_list:
+        # Keyword für die Suche vorbereiten (alles in Kleinbuchstaben für case-insensitive Suche)
+        keyword = hw['keywords'].lower()
+        
+        # Struktur für das finale JSON aufbauen
+        hw_threat_profile = {
+            'materialnummer': hw['materialnummer'],
+            'bezeichnung': hw['bezeichnung'],
+            'suchbegriff': hw['keywords'],
+            'gefundene_bedrohungen': []
+        }
+
+        # Durchsuche alle MITRE-Einträge
+        for threat in raw_mitre_data:
+            # Wir nehmen an, dass 'name' und 'description' die relevanten Felder im MITRE JSON sind.
+            # Passe diese Keys an, falls deine fetch_mitre_data() Struktur anders aussieht.
+            threat_name = threat.get('name', '').lower()
+            threat_desc = threat.get('description', '').lower()
+            
+            # Wenn das Keyword im Namen oder der Beschreibung auftaucht, füge es hinzu
+            if keyword in threat_name or keyword in threat_desc:
+                hw_threat_profile['gefundene_bedrohungen'].append(threat)
+
+        # Baugruppe nur hinzufügen, wenn auch Bedrohungen gefunden wurden
+        # (Optional: Du kannst das if-Statement entfernen, wenn du auch Baugruppen mit 0 Threats protokollieren willst)
+        if hw_threat_profile['gefundene_bedrohungen']:
+            analyzed_hardware.append(hw_threat_profile)
+
+    return analyzed_hardware
+
 
 def run_pipeline():
+    # 1. Setup & Timestamp
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     os.makedirs(SUBREPO_PATH, exist_ok=True)
     
-    raw_data = fetch_mitre_data()
-    tasks = get_excel_tasks("Produktliste_Luetze.xlsx")
+    print("[*] Starte MITRE Pipeline...")
 
-    # Mapping vorbereiten für Performance
-    mitigations = {obj['id']: obj for obj in raw_data if obj.get('type') == 'course-of-action'}
-    relationships = [obj for obj in raw_data if obj.get('type') == 'relationship' and obj.get('relationship_type') == 'mitigates']
+    # 2. Daten abrufen (Hier würdest du deine Funktion aufrufen)
+    print("[*] Beziehe rohe Daten von MITRE...")
+    # raw_data = fetch_mitre_data()
+    
+    # --- DUMMY DATEN ZUM TESTEN DER PIPELINE ---
+    raw_data = [
+        {"id": "T0806", "name": "Brute Force", "description": "Adversaries may use brute force to compromise Ethernet networks."},
+        {"id": "T0843", "name": "Program Download", "description": "Adversaries may download a new program over a Can Bus connection."},
+        {"id": "T0861", "name": "Point & Tag Identification", "description": "Identify serial devices and read tags."},
+        {"id": "T0888", "name": "Remote System Discovery", "description": "Unrelated protocol discovery."}
+    ]
+    # -------------------------------------------
 
-    for task in tasks:
-        clean_name = "".join(e for e in task['bezeichnung'] if e.isalnum() or e == " ").replace(" ", "-")
-        filename = f"{run_timestamp}_{task['materialnummer']}_{clean_name}.json"
+    # 3. Daten filtern
+    print("[*] Filtere Daten für Hardware-Threat-Analyse...")
+    filtered_threat_data = filter_mitre_for_hardware(raw_data, TEST)
+
+    # 4. Daten speichern
+    output_filename = os.path.join(SUBREPO_PATH, f"threat_analysis_basis_{run_timestamp}.json")
+    
+    with open(output_filename, 'w', encoding='utf-8') as outfile:
+        # indent=4 macht das JSON schön lesbar (Pretty Print)
+        json.dump(filtered_threat_data, outfile, ensure_ascii=False, indent=4)
         
-        filtered_results = []
-        keywords = [k.lower() for k in task['keywords']]
+    print(f"[+] Pipeline erfolgreich beendet! Datei gespeichert unter: {output_filename}")
 
-        for obj in raw_data:
-            if obj.get("type") == "attack-pattern":
-                name = obj.get("name", "").lower()
-                desc = obj.get("description", "").lower()
-                platforms = [p.lower() for p in obj.get("x_mitre_platforms", [])]
-                assets = [a.lower() for a in obj.get("x_mitre_assets", [])]
-
-                # --- DER FILTER-CHECK ---
-                # 1. Keyword muss in Name, Beschreibung ODER Asset-Tag sein
-                keyword_match = any(k in name or k in desc or k in assets for k in keywords)
-                # 2. Plattform muss Hardware-nah sein (kein Windows/Cloud Fokus)
-                platform_match = any(p in VALID_PLATFORMS for p in platforms)
-                # 3. Blacklist Check
-                on_blacklist = any(b in name or b in desc for b in BLACKLIST)
-
-                if keyword_match and platform_match and not on_blacklist:
-                    tech_id = obj.get("id")
-                    ext_id = obj.get("external_references", [{}])[0].get("external_id")
-                    
-                    # Verknüpfte Mitigations finden
-                    found_mitigations = []
-                    for rel in relationships:
-                        if rel.get('target_ref') == tech_id:
-                            mit = mitigations.get(rel.get('source_ref'))
-                            if mit:
-                                found_mitigations.append({
-                                    "id": mit.get("external_references", [{}])[0].get("external_id"),
-                                    "name": mit.get("name"),
-                                    "description": mit.get("description")
-                                })
-
-                    filtered_results.append({
-                        "asset": task['bezeichnung'],
-                        "attack_pattern": {"id": ext_id, "name": obj.get("name"), "description": obj.get("description")},
-                        "weaknesses": ["CWE-XXX: Manuell durch Experte zu ergänzen"],
-                        "mitigations": found_mitigations
-                    })
-
-        with open(os.path.join(SUBREPO_PATH, filename), "w", encoding="utf-8") as f:
-            json.dump(filtered_results, f, indent=4, ensure_ascii=False)
-        print(f"Datei erstellt: {filename} ({len(filtered_results)} relevante Treffer)")
 
 if __name__ == "__main__":
     run_pipeline()
-    
+
