@@ -254,4 +254,97 @@ def run_pipeline():
 
 if __name__ == "__main__":
     run_pipeline()
-                                    
+
+
+
+import sqlite3
+import os
+
+DB_NAME = "threat_modeling.db"
+
+def connect_db():
+    if not os.path.exists(DB_NAME):
+        print("[!] Datenbank nicht gefunden. Bitte erst setup_db.py ausführen.")
+        return None
+    return sqlite3.connect(DB_NAME)
+
+def show_models_without_keywords(conn):
+    """Zeigt alle Software-Modelle, die noch keine MITRE-Keywords haben."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT software_id FROM threat_modelle WHERE keywords = '' OR keywords IS NULL")
+    rows = cursor.fetchall()
+    
+    if not rows:
+        print("\n[+] Super! Alle Modelle haben bereits Keywords.")
+        return
+        
+    print(f"\n[*] Es gibt {len(rows)} Modelle OHNE Keywords:")
+    for row in rows:
+        print(f"  - {row[0]}")
+
+def update_keywords(conn):
+    """Lässt dich Keywords für ein Modell eintragen."""
+    software_id = input("\nFür welche Software-ID möchtest du Keywords eintragen? (z.B. 740.hex): ").strip()
+    keywords = input("Gib die MITRE-Keywords kommagetrennt ein (z.B. plc, safety controller, rtu): ").strip()
+    
+    cursor = conn.cursor()
+    cursor.execute("UPDATE threat_modelle SET keywords = ? WHERE software_id = ?", (keywords, software_id))
+    
+    if cursor.rowcount > 0:
+        conn.commit()
+        print(f"[+] Keywords für '{software_id}' erfolgreich aktualisiert!")
+    else:
+        print(f"[-] Fehler: Software-ID '{software_id}' nicht in der Datenbank gefunden.")
+
+def add_new_product(conn):
+    """Fügt ein einzelnes neues Produkt samt Modell manuell hinzu."""
+    print("\n--- NEUES PRODUKT ANLEGEN ---")
+    mat_nr = input("Materialnummer (z.B. 104444.01): ").strip()
+    bez = input("Bezeichnung (z.B. LION-NEU-MODUL): ").strip()
+    software_id = input("Software-ID (z.B. 800.hex oder 104444_base): ").strip()
+    
+    cursor = conn.cursor()
+    
+    # 1. Modell anlegen (falls es nicht existiert)
+    cursor.execute("INSERT OR IGNORE INTO threat_modelle (software_id, keywords) VALUES (?, ?)", (software_id, ""))
+    
+    # 2. Produkt anlegen
+    cursor.execute("INSERT OR REPLACE INTO produkte (materialnummer, bezeichnung, software_id) VALUES (?, ?, ?)", 
+                   (mat_nr, bez, software_id))
+    
+    conn.commit()
+    print(f"[+] Produkt '{mat_nr}' erfolgreich angelegt und mit Modell '{software_id}' verknüpft!")
+    print(f"[*] Vergiss nicht, über Option 2 noch die Keywords für '{software_id}' einzutragen.")
+
+def main_menu():
+    conn = connect_db()
+    if not conn: return
+
+    while True:
+        print("\n" + "="*40)
+        print(" THREAT MODELING - DATENBANK MANAGER")
+        print("="*40)
+        print("1) Zeige Modelle ohne Keywords")
+        print("2) Keywords für ein Modell eintragen / ändern")
+        print("3) Neues einzelnes Produkt manuell anlegen")
+        print("4) Beenden")
+        
+        auswahl = input("\nBitte wähle eine Aktion (1-4): ").strip()
+        
+        if auswahl == '1':
+            show_models_without_keywords(conn)
+        elif auswahl == '2':
+            update_keywords(conn)
+        elif auswahl == '3':
+            add_new_product(conn)
+        elif auswahl == '4':
+            print("Tschüss!")
+            break
+        else:
+            print("Ungültige Eingabe.")
+            
+    conn.close()
+
+if __name__ == "__main__":
+    main_menu()
+    
